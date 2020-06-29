@@ -80,7 +80,6 @@ typedef struct query_ctx {
 
 typedef struct remote_ctx {
     ev_io io;
-    ev_timer watcher;
     int af;
     int fd;
     struct sockaddr_storage src_addr;
