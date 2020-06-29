@@ -55,9 +55,9 @@
 #include "winsock.h"
 
 #ifdef MODULE_REMOTE
-#define MAX_UDP_CONN_NUM 512
+#define MAX_UDP_CONN_NUM 128
 #else
-#define MAX_UDP_CONN_NUM 256
+#define MAX_UDP_CONN_NUM 64
 #endif
 
 #ifdef MODULE_REMOTE
@@ -76,7 +76,6 @@
 
 static void server_recv_cb(EV_P_ ev_io *w, int revents);
 static void remote_recv_cb(EV_P_ ev_io *w, int revents);
-static void remote_timeout_cb(EV_P_ ev_timer *watcher, int revents);
 
 static char *hash_key(const int af, const struct sockaddr_storage *addr);
 #ifdef MODULE_REMOTE
@@ -557,8 +556,6 @@ new_remote(int fd, server_ctx_t *server_ctx)
     ctx->af         = AF_UNSPEC;
 
     ev_io_init(&ctx->io, remote_recv_cb, fd, EV_READ);
-    ev_timer_init(&ctx->watcher, remote_timeout_cb, server_ctx->timeout,
-                  server_ctx->timeout);
 
     return ctx;
 }
@@ -607,25 +604,10 @@ void
 close_and_free_remote(EV_P_ remote_ctx_t *ctx)
 {
     if (ctx != NULL) {
-        ev_timer_stop(EV_A_ & ctx->watcher);
         ev_io_stop(EV_A_ & ctx->io);
         close(ctx->fd);
         ss_free(ctx);
     }
-}
-
-static void
-remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
-{
-    remote_ctx_t *remote_ctx
-        = cork_container_of(watcher, remote_ctx_t, watcher);
-
-    if (verbose) {
-        LOGI("[udp] connection timeout");
-    }
-
-    char *key = hash_key(remote_ctx->af, &remote_ctx->src_addr);
-    cache_remove(remote_ctx->server_ctx->conn_cache, key, HASH_KEY_LEN);
 }
 
 #ifdef MODULE_REMOTE
@@ -717,7 +699,6 @@ resolv_cb(struct sockaddr *addr, void *data)
                     char *key = hash_key(AF_UNSPEC, &remote_ctx->src_addr);
                     cache_insert(query_ctx->server_ctx->conn_cache, key, HASH_KEY_LEN, (void *)remote_ctx);
                     ev_io_start(EV_A_ & remote_ctx->io);
-                    ev_timer_start(EV_A_ & remote_ctx->watcher);
                 }
             }
         }
@@ -902,10 +883,6 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     }
 
 #endif
-
-    // handle the UDP packet successfully,
-    // triger the timer
-    ev_timer_again(EV_A_ & remote_ctx->watcher);
 
 CLEAN_UP:
 
@@ -1149,11 +1126,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         }
     }
 
-    // reset the timer
-    if (remote_ctx != NULL) {
-        ev_timer_again(EV_A_ & remote_ctx->watcher);
-    }
-
     if (remote_ctx == NULL) {
         if (verbose) {
 #ifdef MODULE_REDIR
@@ -1245,7 +1217,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
         // Start remote io
         ev_io_start(EV_A_ & remote_ctx->io);
-        ev_timer_start(EV_A_ & remote_ctx->watcher);
     }
 
     if (offset > 0) {
@@ -1350,7 +1321,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 cache_insert(server_ctx->conn_cache, key, HASH_KEY_LEN, (void *)remote_ctx);
 
                 ev_io_start(EV_A_ & remote_ctx->io);
-                ev_timer_start(EV_A_ & remote_ctx->watcher);
             }
         }
     } else {
@@ -1434,6 +1404,24 @@ init_udprelay(const char *server_host, const char *server_port,
 #ifdef MODULE_TUNNEL
     server_ctx->tunnel_addr = tunnel_addr;
 #endif
+#endif
+
+#ifdef MODULE_REMOTE
+    // warm up the UDP conn cache
+    for (size_t i = 0; i < MAX_UDP_CONN_NUM; i++) {
+        int remotefd = create_remote_socket(false);
+
+        if (remotefd == -1) {
+            FATAL("Failed to warm up UDP connection cache");
+        }
+
+        // Init remote_ctx
+        remote_ctx_t *remote_ctx = new_remote(remotefd, server_ctx);
+        char *key = hash_key(remote_ctx->af, &remote_ctx->src_addr);
+
+        // Add to conn cache
+        cache_insert(conn_cache, key, HASH_KEY_LEN, (void *)remote_ctx);
+    }
 #endif
 
     ev_io_start(loop, &server_ctx->io);
